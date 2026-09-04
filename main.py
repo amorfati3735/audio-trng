@@ -92,12 +92,16 @@ def von_neumann_debias(bits: np.ndarray) -> np.ndarray:
     return pairs[0][mask]
 
 
-def hash_condition(bits: np.ndarray, seed: bytes | None = None) -> bytes:
+def hash_condition(bits: np.ndarray, seed: bytes | None = None, blocks: int = 1) -> bytes:
     raw = np.packbits(bits).tobytes()
-    h = hashlib.sha256(raw)
-    if seed:
-        h.update(seed)
-    return h.digest()
+    out = bytearray()
+    for i in range(blocks):
+        h = hashlib.sha256(raw)
+        h.update(i.to_bytes(4, "big"))
+        if seed:
+            h.update(seed)
+        out.extend(h.digest())
+    return bytes(out)
 
 
 def bits_to_uint32(bits: np.ndarray) -> list[int]:
@@ -210,7 +214,8 @@ def main():
         bits = von_neumann_debias(bits)
         print(f"  after debias: {len(bits)}")
 
-    digest = hash_condition(bits, seed_bytes)
+    blocks = max(1, (args.count * 32 + 255) // 256)
+    digest = hash_condition(bits, seed_bytes, blocks=blocks)
     out_bits = np.unpackbits(np.frombuffer(digest, dtype=np.uint8))
 
     if args.test:
@@ -237,15 +242,10 @@ def main():
         else:
             print("\n--- repetition check: no repeated 16-byte windows ---")
 
-    nums = bits_to_uint32(out_bits[:2**20])
-    if len(nums) > 256:
-        print(f"\n--- last 16 of {len(nums)} random uint32s ---")
-        for n in nums[-16:]:
-            print(n)
-    elif len(nums) > 16:
-        print(f"\n--- {len(nums)} random uint32s ---")
-        for n in nums:
-            print(n)
+    nums = bits_to_uint32(out_bits[: args.count * 32])
+    print(f"\n--- {len(nums)} random uint32s ---")
+    for n in nums:
+        print(n)
 
 
 if __name__ == "__main__":
