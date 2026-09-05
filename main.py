@@ -94,13 +94,25 @@ def von_neumann_debias(bits: np.ndarray) -> np.ndarray:
 
 
 def hash_condition(bits: np.ndarray, seed: bytes | None = None, blocks: int = 1) -> bytes:
+    """SHA-256 keyed counter (CTR) conditioning.
+
+    Hash the raw entropy once to derive a key, then expand it in counter
+    mode so any number of blocks can be produced cheaply and independently
+    (SHA-256(key || counter)). Output blocks are independent of each other,
+    so conditioning matches output size without re-hashing the source.
+    """
     raw = np.packbits(bits).tobytes()
+    if seed is None:
+        seed = b""
+    master = hashlib.sha256()
+    master.update(len(seed).to_bytes(4, "big"))
+    master.update(seed)
+    master.update(raw)
+    key = master.digest()
     out = bytearray()
     for i in range(blocks):
-        h = hashlib.sha256(raw)
+        h = hashlib.sha256(key)
         h.update(i.to_bytes(4, "big"))
-        if seed:
-            h.update(seed)
         out.extend(h.digest())
     return bytes(out)
 
@@ -215,7 +227,14 @@ def main():
         bits = von_neumann_debias(bits)
         print(f"  after debias: {len(bits)}")
 
-    blocks = max(1, (args.count * 32 + 255) // 256)
+    # Enough SHA-256 blocks (=256 bits each) for the requested uint32 count
+    # AND, if an image is requested, for the full W*H*8 bits of image data.
+    # Otherwise bits_to_image() re-tiles a short digest -> barcode pattern.
+    count_bits = args.count * 32
+    image_bits = 0
+    if args.image:
+        image_bits = args.image_size[0] * args.image_size[1] * 8
+    blocks = max(1, (count_bits + 255) // 256, (image_bits + 255) // 256)
     digest = hash_condition(bits, seed_bytes, blocks=blocks)
     out_bits = np.unpackbits(np.frombuffer(digest, dtype=np.uint8))
 
