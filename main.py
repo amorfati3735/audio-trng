@@ -87,7 +87,8 @@ def extract_raw_bits(
 
 
 def von_neumann_debias(bits: np.ndarray) -> np.ndarray:
-    pairs = bits[::2], bits[1::2]
+    n_even = len(bits) - (len(bits) % 2)
+    pairs = bits[:n_even][::2], bits[:n_even][1::2]
     mask = pairs[0] != pairs[1]
     return pairs[0][mask]
 
