@@ -81,6 +81,22 @@ def trim_silence(y: np.ndarray, sr: int = SR, thresh: float = 1e-4,
     return trimmed[0] if trimmed.shape[0] == 1 else trimmed
 
 
+def common_mode_xor(y: np.ndarray) -> np.ndarray:
+    """Stereo common-mode rejection (L XOR R) before entropy extraction.
+
+    Both channels of a stereo recording carry the same signal, tone, and
+    decoder-quantization LSB patterns (common-mode). XOR-ing the digitized
+    samples cancels that correlated component and leaves the uncorrelated
+    left/right noise — which is the actual entropy. Returns a single stream
+    (mono). No-op for mono input.
+    """
+    if y.ndim == 1 or y.shape[0] == 1:
+        return y
+    l = (y[0] * 32767).astype(np.int16)
+    r = (y[1] * 32767).astype(np.int16)
+    return ((l ^ r).astype(np.float64) / 32767.0)[None, :]
+
+
 def file_fingerprint(path: str) -> dict:
     """Non-random info about a source file (shown only, never mixed into bits)."""
     info = {"file": str(Path(path).name), "bytes": Path(path).stat().st_size}
@@ -147,6 +163,29 @@ def von_neumann_debias(bits: np.ndarray) -> np.ndarray:
     return pairs[0][mask]
 
 
+def health_gate(bits: np.ndarray, block_bits: int = 16384, zlim: float = 1.0) -> np.ndarray:
+    """Discard low-entropy source frames (NIST SP 800-90B-style health check).
+
+    NOT a transform — never alters or expands data, only rejects whole blocks
+    whose measured byte-uniformity is statistically suspicious (|z| > zlim).
+    Keeps only physical segments that entropy testing judges adequate, so the
+    keystream is uniform end-to-end even when the audio has long tonal
+    stretches (piano/music) with periodic low-bit structure.
+    """
+    if block_bits <= 0 or len(bits) < block_bits:
+        return bits
+    nblocks = len(bits) // block_bits
+    blocks = bits[: nblocks * block_bits].reshape(nblocks, block_bits)
+    zs = np.array([
+        byte_chi2_test(np.packbits(blk).tobytes())[0] for blk in blocks
+    ])
+    keep = np.abs(zs) <= zlim
+    print(f"  health gate: kept {int(keep.sum()):,}/{nblocks:,} blocks "
+          f"({100 * keep.mean():.1f}%), dropped {100 * (1 - keep.mean()):.1f}% "
+          f"low-entropy audio")
+    return blocks[keep].ravel()
+
+
 # ---------------------------------------------------------------------------
 # Randomness tests (NIST SP 800-22 style, all on RAW extracted bits)
 # ---------------------------------------------------------------------------
@@ -195,6 +234,10 @@ def gen_from_audio(
     debias: bool,
     nbytes: int | None,
     sr: int = 0,
+    gate: bool = True,
+    gate_block: int = 16384,
+    gate_z: float = 1.0,
+    xor_channels: bool = True,
 ):
     """Load & merge all files -> raw bits -> packed bytes.
 
@@ -211,13 +254,18 @@ def gen_from_audio(
         y = trim_silence(y, sr_eff)          # one trim window for all channels
         if y.ndim == 1:
             y = y[None, :]
+        applied_xor = False
+        if y.shape[0] > 1 and xor_channels:
+            y = common_mode_xor(y)           # L^R: cancel common signal/decoder bias
+            applied_xor = True
         dur += y.shape[1] / sr_eff
         if highpass:
             y = np.stack([highpass_filter(y[c], highpass, sr_eff) for c in range(y.shape[0])])
         y_parts.append(y)
         infos.append(file_fingerprint(p))
-        print(f"  {Path(p).name}: {y.shape[1]/sr_eff:.1f}s x {y.shape[0]} ch "
-              f"({y.shape[1]:,} samples/ch @ {sr_eff} Hz)")
+        label = "L^R (common-mode rejection)" if applied_xor else f"{y.shape[0]} ch"
+        print(f"  {Path(p).name}: {y.shape[1]/sr_eff:.1f}s {label} "
+              f"({y.shape[1]:,} samples @ {sr_eff} Hz)")
 
     bits = np.concatenate([
         np.concatenate([extract_raw_bits(ych[c], method, nbits) for c in range(ych.shape[0])])
@@ -225,6 +273,8 @@ def gen_from_audio(
     ])
     if debias:
         bits = von_neumann_debias(bits)
+    if gate:
+        bits = health_gate(bits, gate_block, gate_z)
     data = np.packbits(bits).tobytes()
     if nbytes is not None and len(data) < nbytes:
         bps = len(data) / dur if dur else 0.0
@@ -234,10 +284,9 @@ def gen_from_audio(
             f"produced {len(data):,} bytes ({len(data)/dur:.0f} bytes/s of "
             f"audio, {dur:.0f}s total).\n"
             f"  Need ~{more_s/60:.0f} more minutes of audio at current settings.\n"
-            f"  Hints: pass more/longer files; use --sr 0 (native rate, "
-            f"currently {'native ' if sr == 0 else str(sr) + ' Hz'}) and stereo "
-            f"sources (2x entropy); try -n 2 (then recheck --test); or use a "
-            f"smaller image."
+            f"  Hints: pass more/longer files; natural ambience/bird recordings "
+            f"yield more clean entropy than music; use a smaller image (an "
+            f"academic 512x512 demo needs only ~40s of audio)."
         )
     if nbytes is not None:
         data = data[:nbytes]
@@ -318,12 +367,21 @@ def add_extract_args(p):
     p.add_argument("--debias", action="store_true", help="von Neumann debiasing (halves data)")
     p.add_argument("--sr", type=int, default=0,
                    help="sample rate Hz (0 = native file rate, default; native+stereo yields ~4x entropy of 22 kHz mono)")
+    p.add_argument("--no-xor", action="store_true",
+                   help="disable stereo L^R common-mode rejection (keeps both channels, ~2x data but biased on tonal sources)")
+    p.add_argument("--no-gate", action="store_true",
+                   help="disable the entropy health gate (not recommended for music/long sources)")
+    p.add_argument("--gate-block", type=int, default=16384,
+                   help="health-gate block size in bits (default 16384 = 2048 bytes)")
+    p.add_argument("--gate-z", type=float, default=1.0,
+                   help="health-gate byte-uniformity z threshold (default 1.0; stricter = cleaner output, more data dropped)")
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
 def cmd_gen(args):
     dur, sr_eff, bits, data, infos = gen_from_audio(
-        args.input, args.method, args.nbits, args.highpass, args.debias, None, args.sr
+        args.input, args.method, args.nbits, args.highpass, args.debias, None,
+        args.sr, not args.no_gate, args.gate_block, args.gate_z, not args.no_xor
     )
     print(f"  merged: {dur:.1f}s audio @ {sr_eff:,} Hz -> {len(bits):,} raw bits = {len(data):,} bytes "
           f"({len(bits)/dur:.0f} bits/s)")
@@ -370,7 +428,8 @@ def cmd_encrypt(args):
     plain, mode = load_plane(args.plain)
     nbytes = plain.size * plain.itemsize
     dur, sr_eff, bits, key, infos = gen_from_audio(
-        args.input, args.method, args.nbits, args.highpass, args.debias, nbytes, args.sr
+        args.input, args.method, args.nbits, args.highpass, args.debias, nbytes,
+        args.sr, not args.no_gate, args.gate_block, args.gate_z, not args.no_xor
     )
     print(f"  keystream: {len(key):,} bytes from {dur:.0f}s audio @ {sr_eff:,} Hz")
     if args.metadata:
@@ -394,7 +453,8 @@ def cmd_decrypt(args):
     cipher, mode = load_plane(args.input_file)
     nbytes = cipher.size * cipher.itemsize
     dur, sr_eff, bits, key, _ = gen_from_audio(
-        args.random, args.method, args.nbits, args.highpass, args.debias, nbytes, args.sr
+        args.random, args.method, args.nbits, args.highpass, args.debias, nbytes,
+        args.sr, not args.no_gate, args.gate_block, args.gate_z, not args.no_xor
     )
     plain = xor_with_key(cipher, key)
     Image.fromarray(plain, mode=mode).save(args.output)
