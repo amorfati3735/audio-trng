@@ -18,3 +18,8 @@ demo/
 
 # Generated randomness
 random.png
+cipher_*.png
+keystream*.png
+
+# Large input / derived images
+photo*.png

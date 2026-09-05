@@ -38,9 +38,14 @@ METHODS = ("lsb", "diff", "zero_cross", "adc_noise", "mixed")
 # ---------------------------------------------------------------------------
 # Audio loading / filtering
 # ---------------------------------------------------------------------------
-def load_audio(path: str, sr: int = SR) -> np.ndarray:
-    y, _ = librosa.load(path, sr=sr, mono=True)
-    return y
+def load_audio(path: str, sr: int = 0):
+    """Load a file, returning (samples, sr). Samples are 1-D for mono
+    sources or (channels, n) for stereo. sr=0 keeps the file's native
+    sample rate — more samples/sec = more physical entropy per minute."""
+    if sr == 0:
+        sr = None
+    y, sr_out = librosa.load(path, sr=sr, mono=False)
+    return y, sr_out
 
 
 def highpass_filter(y: np.ndarray, cutoff: float, sr: int = SR) -> np.ndarray:
@@ -48,21 +53,32 @@ def highpass_filter(y: np.ndarray, cutoff: float, sr: int = SR) -> np.ndarray:
     return sosfilt(sos, y)
 
 
+def silence_bounds(y: np.ndarray, sr: int = SR, thresh: float = 1e-4,
+                   win: int = 2048, hop: int = 1024) -> tuple[int, int]:
+    """Onset/offset sample indices where the RMS envelope exceeds thresh."""
+    frames = librosa.util.frame(y, frame_length=win, hop_length=hop)
+    rms = np.sqrt(np.mean(frames**2, axis=0))
+    on = np.nonzero(rms > thresh)[0]
+    if len(on) == 0:
+        return 0, len(y)
+    start = int(on[0]) * hop
+    end = min(int(on[-1] + 1) * hop + win, len(y))
+    return start, end
+
+
 def trim_silence(y: np.ndarray, sr: int = SR, thresh: float = 1e-4,
                  win: int = 2048, hop: int = 1024) -> np.ndarray:
     """Cut leading/trailing silence (incl. MP3 decoder lead-in zeros).
 
     Zero/LSB-constant regions carry no entropy and bias the start of the
-    stream, so only frames whose RMS exceeds thresh (~ -80 dBFS) are kept.
+    stream. Non-silent bounds are computed once and applied identically to
+    every channel, so multi-channel arrays keep matching lengths.
     """
-    frames = librosa.util.frame(y, frame_length=win, hop_length=hop)
-    rms = np.sqrt(np.mean(frames**2, axis=0))
-    on = np.nonzero(rms > thresh)[0]
-    if len(on) == 0:
-        return y
-    start = int(on[0]) * hop
-    end = min(int(on[-1] + 1) * hop + win, len(y))
-    return y[start:end]
+    if y.ndim == 1:
+        y = y[None, :]
+    start, end = silence_bounds(y.mean(axis=0), sr, thresh, win, hop)
+    trimmed = y[:, start:end]
+    return trimmed[0] if trimmed.shape[0] == 1 else trimmed
 
 
 def file_fingerprint(path: str) -> dict:
@@ -178,39 +194,54 @@ def gen_from_audio(
     highpass: float,
     debias: bool,
     nbytes: int | None,
+    sr: int = 0,
 ):
     """Load & merge all files -> raw bits -> packed bytes.
 
-    Returns (dur_s, bits, data_bytes, per_file_info). nbytes=None returns
-    everything; otherwise returns at most nbytes (raises if too little).
+    Every channel of every file is an independent physical noise stream, so
+    stereo sources contribute 2x the entropy. Returns (dur_s, sr_eff,
+    bits, data_bytes, per_file_info). nbytes=None returns everything;
+    otherwise returns at most nbytes (error if too little).
     """
-    y_parts, infos, dur = [], [], 0.0
+    y_parts, infos, dur, sr_eff = [], [], 0.0, SR
     for p in files:
         if not Path(p).exists():
             sys.exit(f"error: file not found: {p}")
-        y = load_audio(p)
-        y = trim_silence(y)  # drop no-entropy lead-in/tail (MP3 zeros, silence)
-        dur += len(y) / SR
+        y, sr_eff = load_audio(p, sr)
+        y = trim_silence(y, sr_eff)          # one trim window for all channels
+        if y.ndim == 1:
+            y = y[None, :]
+        dur += y.shape[1] / sr_eff
         if highpass:
-            y = highpass_filter(y, highpass)
+            y = np.stack([highpass_filter(y[c], highpass, sr_eff) for c in range(y.shape[0])])
         y_parts.append(y)
         infos.append(file_fingerprint(p))
-        print(f"  {Path(p).name}: {len(y)/SR:.1f}s, {len(y)} samples")
+        print(f"  {Path(p).name}: {y.shape[1]/sr_eff:.1f}s x {y.shape[0]} ch "
+              f"({y.shape[1]:,} samples/ch @ {sr_eff} Hz)")
 
-    y = np.concatenate(y_parts)
-    bits = extract_raw_bits(y, method, nbits)
+    bits = np.concatenate([
+        np.concatenate([extract_raw_bits(ych[c], method, nbits) for c in range(ych.shape[0])])
+        for ych in y_parts
+    ])
     if debias:
         bits = von_neumann_debias(bits)
     data = np.packbits(bits).tobytes()
     if nbytes is not None and len(data) < nbytes:
+        bps = len(data) / dur if dur else 0.0
+        more_s = (nbytes - len(data)) / bps if bps else float("inf")
         sys.exit(
-            f"error: need {nbytes} bytes of entropy but only {len(data)} "
-            f"available ({len(data) * 8} bits from {dur:.0f}s audio). "
-            f"Add more/longer mp3 files."
+            f"error: need {nbytes:,} bytes of keystream but the audio pool "
+            f"produced {len(data):,} bytes ({len(data)/dur:.0f} bytes/s of "
+            f"audio, {dur:.0f}s total).\n"
+            f"  Need ~{more_s/60:.0f} more minutes of audio at current settings.\n"
+            f"  Hints: pass more/longer files; use --sr 0 (native rate, "
+            f"currently {'native ' if sr == 0 else str(sr) + ' Hz'}) and stereo "
+            f"sources (2x entropy); try -n 2 (then recheck --test); or use a "
+            f"smaller image."
         )
     if nbytes is not None:
         data = data[:nbytes]
-    return dur, bits, data, infos
+    return dur, sr_eff, bits, data, infos
 
 
 def bits_to_uint32(bits: np.ndarray) -> list[int]:
@@ -285,14 +316,17 @@ def add_extract_args(p):
     p.add_argument("--highpass", type=float, default=0.0,
                    help="highpass cutoff Hz per file (0 = off; usually not needed)")
     p.add_argument("--debias", action="store_true", help="von Neumann debiasing (halves data)")
+    p.add_argument("--sr", type=int, default=0,
+                   help="sample rate Hz (0 = native file rate, default; native+stereo yields ~4x entropy of 22 kHz mono)")
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
 def cmd_gen(args):
-    dur, bits, data, infos = gen_from_audio(
-        args.input, args.method, args.nbits, args.highpass, args.debias, None
+    dur, sr_eff, bits, data, infos = gen_from_audio(
+        args.input, args.method, args.nbits, args.highpass, args.debias, None, args.sr
     )
-    print(f"  merged: {dur:.1f}s audio -> {len(bits)} raw bits = {len(data)} bytes")
+    print(f"  merged: {dur:.1f}s audio @ {sr_eff:,} Hz -> {len(bits):,} raw bits = {len(data):,} bytes "
+          f"({len(bits)/dur:.0f} bits/s)")
 
     if args.metadata:
         for info in infos:
@@ -335,10 +369,10 @@ def cmd_gen(args):
 def cmd_encrypt(args):
     plain, mode = load_plane(args.plain)
     nbytes = plain.size * plain.itemsize
-    dur, bits, key, infos = gen_from_audio(
-        args.input, args.method, args.nbits, args.highpass, args.debias, nbytes
+    dur, sr_eff, bits, key, infos = gen_from_audio(
+        args.input, args.method, args.nbits, args.highpass, args.debias, nbytes, args.sr
     )
-    print(f"  keystream: {len(key)} bytes from {dur:.1f}s audio")
+    print(f"  keystream: {len(key):,} bytes from {dur:.0f}s audio @ {sr_eff:,} Hz")
     if args.metadata:
         for info in infos:
             print(f"  {info['file']}: bitrate={info.get('bitrate', '?')}bps, "
@@ -359,8 +393,8 @@ def cmd_encrypt(args):
 def cmd_decrypt(args):
     cipher, mode = load_plane(args.input_file)
     nbytes = cipher.size * cipher.itemsize
-    dur, bits, key, _ = gen_from_audio(
-        args.random, args.method, args.nbits, args.highpass, args.debias, nbytes
+    dur, sr_eff, bits, key, _ = gen_from_audio(
+        args.random, args.method, args.nbits, args.highpass, args.debias, nbytes, args.sr
     )
     plain = xor_with_key(cipher, key)
     Image.fromarray(plain, mode=mode).save(args.output)
