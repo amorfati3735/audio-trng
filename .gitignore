@@ -12,5 +12,9 @@ wheels/
 # Large media / generated output
 chirp.mp3
 *.mp3
-random.png
 
+# Demo outputs
+demo/
+
+# Generated randomness
+random.png

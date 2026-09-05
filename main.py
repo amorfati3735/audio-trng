@@ -1,5 +1,17 @@
+#!/usr/bin/env python3
+"""Audio-based True Random Number Generator + image encryption demo.
+
+Randomness comes ONLY from physical processes in the audio signal
+(ADC quantization noise, environmental noise, non-stationary signal
+content). No cryptographic conditioning (SHA-256 etc.) is used — the
+extracted bits stand on their own.
+
+Subcommands:
+  gen      chirp*.mp3              -> random uint32s / grayscale image / raw bytes
+  encrypt  chirp*.mp3 -i img.png   -> cipher.png   (keystream XOR)
+  decrypt  chirp*.mp3 -i ciph.png  -> plain.png    (same keystream XOR)
+"""
 import argparse
-import hashlib
 import struct
 import sys
 from pathlib import Path
@@ -19,136 +31,109 @@ try:
 except ImportError:
     mutagen = None
 
+SR = 22050
+METHODS = ("lsb", "diff", "zero_cross", "adc_noise", "mixed")
 
-def load_audio(path: str, sr: int | None = 22050) -> np.ndarray:
+
+# ---------------------------------------------------------------------------
+# Audio loading / filtering
+# ---------------------------------------------------------------------------
+def load_audio(path: str, sr: int = SR) -> np.ndarray:
     y, _ = librosa.load(path, sr=sr, mono=True)
     return y
 
 
-def highpass_filter(y: np.ndarray, cutoff: float = 3000, sr: int = 22050) -> np.ndarray:
+def highpass_filter(y: np.ndarray, cutoff: float, sr: int = SR) -> np.ndarray:
     sos = butter(10, cutoff, btype="high", fs=sr, output="sos")
     return sosfilt(sos, y)
 
 
-def extract_mp3_metadata(path: str) -> bytes:
-    if mutagen is None:
-        return b""
-    try:
-        audio = MP3(path)
-        meta = bytearray()
-        meta.extend(audio.info.bitrate.to_bytes(4, "big"))
-        meta.extend(audio.info.sample_rate.to_bytes(4, "big"))
-        meta.extend(int(audio.info.length * 1000).to_bytes(4, "big"))
-        meta.extend(Path(path).stat().st_size.to_bytes(8, "big"))
-        meta.extend(audio.info.mode.to_bytes(1, "big"))
-        for tag in ("TPE1", "TIT2", "TALB", "TCON", "TDRC"):
-            if tag in audio:
-                val = str(audio[tag]).encode()
-                meta.extend(val)
-        return bytes(meta)
-    except Exception:
-        return Path(path).stat().st_size.to_bytes(8, "big")
+def trim_silence(y: np.ndarray, sr: int = SR, thresh: float = 1e-4,
+                 win: int = 2048, hop: int = 1024) -> np.ndarray:
+    """Cut leading/trailing silence (incl. MP3 decoder lead-in zeros).
+
+    Zero/LSB-constant regions carry no entropy and bias the start of the
+    stream, so only frames whose RMS exceeds thresh (~ -80 dBFS) are kept.
+    """
+    frames = librosa.util.frame(y, frame_length=win, hop_length=hop)
+    rms = np.sqrt(np.mean(frames**2, axis=0))
+    on = np.nonzero(rms > thresh)[0]
+    if len(on) == 0:
+        return y
+    start = int(on[0]) * hop
+    end = min(int(on[-1] + 1) * hop + win, len(y))
+    return y[start:end]
 
 
-def extract_raw_bits(
-    y: np.ndarray,
-    method: str = "lsb",
-    nbits: int = 1,
-) -> np.ndarray:
+def file_fingerprint(path: str) -> dict:
+    """Non-random info about a source file (shown only, never mixed into bits)."""
+    info = {"file": str(Path(path).name), "bytes": Path(path).stat().st_size}
+    if mutagen is not None:
+        try:
+            a = MP3(path)
+            info.update(
+                bitrate=a.info.bitrate,
+                sample_rate=a.info.sample_rate,
+                length=round(a.info.length, 1),
+                mode=a.info.mode,
+            )
+        except Exception:
+            pass
+    return info
+
+
+# ---------------------------------------------------------------------------
+# Entropy extraction  (the core — pure physical bits, no hashing anywhere)
+# ---------------------------------------------------------------------------
+def extract_raw_bits(y: np.ndarray, method: str = "mixed", nbits: int = 1) -> np.ndarray:
     y_int = (y * 32767).astype(np.int16)
+    shifts = np.arange(nbits, dtype=np.int16)
 
-    match method:
-        case "lsb":
-            shifts = np.arange(nbits, dtype=np.int16)
-            bits = ((y_int[:, None] >> shifts) & 1).ravel().astype(np.uint8)
-            return bits
+    if method == "lsb":
+        return ((y_int[:, None] >> shifts) & 1).ravel().astype(np.uint8)
 
-        case "diff":
-            diff = np.diff(y_int)
-            shifts = np.arange(nbits, dtype=np.int16)
-            bits = ((diff[:, None] >> shifts) & 1).ravel().astype(np.uint8)
-            return bits
+    if method == "diff":
+        d = np.diff(y_int)
+        return ((d[:, None] >> shifts) & 1).ravel().astype(np.uint8)
 
-        case "zero_cross":
-            sign = np.sign(y)
-            zc = np.where(np.diff(sign) != 0)[0]
-            intervals = np.diff(zc)
-            return (intervals % 2).astype(np.uint8)
+    if method == "zero_cross":
+        sign = np.sign(y)
+        zc = np.where(np.diff(sign) != 0)[0]
+        intervals = np.diff(zc)
+        return (intervals % 2).astype(np.uint8)
 
-        case "adc_noise":
-            y_int = (y * 32767).astype(np.int16)
-            lo = y_int & 3
-            hi = (y_int >> 2) & 3
-            xor = lo ^ hi
-            return xor.ravel().astype(np.uint8)
+    if method == "adc_noise":
+        mask = (1 << nbits) - 1
+        x = (y_int & mask) ^ ((y_int >> 2) & mask)
+        return ((x[:, None] >> shifts) & 1).ravel().astype(np.uint8)
 
-        case _:
-            raise ValueError(f"unknown method: {method}")
+    if method == "mixed":
+        # XOR of three complementary views: raw LSBs, sample-difference LSBs,
+        # and shifted-plane LSBs. Independent-ish physical mechanisms cancel
+        # any residual bias/correlation present in a single view.
+        mask = (1 << nbits) - 1
+        a = y_int & mask
+        d = np.diff(y_int)
+        d = np.concatenate([d, np.zeros(1, dtype=d.dtype)])
+        b = d & mask
+        c = (y_int >> 2) & mask
+        x = a ^ b ^ c
+        return ((x[:, None] >> shifts) & 1).ravel().astype(np.uint8)
+
+    raise ValueError(f"unknown method: {method}")
 
 
 def von_neumann_debias(bits: np.ndarray) -> np.ndarray:
+    """Classic debiaser: keep 01->0 / 10->1, discard 00/11. Not a hash."""
     n_even = len(bits) - (len(bits) % 2)
     pairs = bits[:n_even][::2], bits[:n_even][1::2]
     mask = pairs[0] != pairs[1]
     return pairs[0][mask]
 
 
-def hash_condition(bits: np.ndarray, seed: bytes | None = None, blocks: int = 1) -> bytes:
-    """SHA-256 keyed counter (CTR) conditioning.
-
-    Hash the raw entropy once to derive a key, then expand it in counter
-    mode so any number of blocks can be produced cheaply and independently
-    (SHA-256(key || counter)). Output blocks are independent of each other,
-    so conditioning matches output size without re-hashing the source.
-    """
-    raw = np.packbits(bits).tobytes()
-    if seed is None:
-        seed = b""
-    master = hashlib.sha256()
-    master.update(len(seed).to_bytes(4, "big"))
-    master.update(seed)
-    master.update(raw)
-    key = master.digest()
-    out = bytearray()
-    for i in range(blocks):
-        h = hashlib.sha256(key)
-        h.update(i.to_bytes(4, "big"))
-        out.extend(h.digest())
-    return bytes(out)
-
-
-def bits_to_uint32(bits: np.ndarray) -> list[int]:
-    flat = bits[: len(bits) - (len(bits) % 32)]
-    packed = np.packbits(flat.reshape(-1, 32)[:, :32])
-    return [struct.unpack(">I", packed[i : i + 4])[0] for i in range(0, len(packed), 4)]
-
-
-def bits_to_image(bits: np.ndarray, size: tuple[int, int] = (512, 512), output: str = "random.png"):
-    if Image is None:
-        print("error: Pillow not installed. run: uv add Pillow")
-        return
-    needed = size[0] * size[1] * 8
-    if len(bits) < needed:
-        bits = np.tile(bits, int(np.ceil(needed / len(bits))))[:needed]
-    trimmed = bits[:needed]
-    pixels = np.packbits(trimmed).reshape(size[0], size[1])
-    img = Image.fromarray(pixels.astype(np.uint8), mode="L")
-    img.save(output)
-    print(f"saved random grayscale image: {output} ({size[0]}x{size[1]})")
-
-
-def detect_repetition(data: bytes, window: int = 16) -> list[tuple[int, int, int]]:
-    repeats = []
-    seen: dict[bytes, int] = {}
-    for i in range(len(data) - window + 1):
-        chunk = data[i : i + window]
-        if chunk in seen:
-            repeats.append((seen[chunk], i, seen[chunk] - i))
-        else:
-            seen[chunk] = i
-    return repeats
-
-
+# ---------------------------------------------------------------------------
+# Randomness tests (NIST SP 800-22 style, all on RAW extracted bits)
+# ---------------------------------------------------------------------------
 def monobit_test(bits: np.ndarray) -> tuple[float, bool]:
     n = len(bits)
     s = np.sum(2 * bits.astype(np.int8) - 1)
@@ -163,109 +148,264 @@ def runs_test(bits: np.ndarray) -> tuple[float, bool]:
         return float("inf"), False
     runs = 1 + np.sum(bits[1:] != bits[:-1])
     denom = 2 * np.sqrt(n) * pi * (1 - pi)
-    func = abs(runs - 2 * n * pi * (1 - pi)) / denom
-    return func, func < 3.29
+    stat = abs(runs - 2 * n * pi * (1 - pi)) / denom
+    return stat, stat < 3.29
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Audio-based True Random Number Generator")
-    ap.add_argument("input", nargs="+", help="audio file(s) — merge multiple for more entropy")
-    ap.add_argument("-n", "--nbits", type=int, default=1, help="bits per sample (1-16)")
-    ap.add_argument(
-        "-m", "--method", choices=["lsb", "diff", "zero_cross", "adc_noise"], default="diff"
-    )
-    ap.add_argument("-c", "--count", type=int, default=256, help="number of 32-bit integers")
-    ap.add_argument("--highpass", type=float, default=0, help="highpass cutoff (0 = disable)")
-    ap.add_argument("--debias", action="store_true", help="von Neumann debiasing")
-    ap.add_argument("--hash", action="store_true", help="SHA-256 conditioning")
-    ap.add_argument("--test", action="store_true", help="NIST-style self-tests")
-    ap.add_argument("--seed", type=str, help="extra seed string")
-    ap.add_argument("--image", type=str, help="save random data as grayscale image (e.g. random.png)")
-    ap.add_argument("--image-size", type=int, nargs=2, default=(512, 512), metavar=("W", "H"))
-    ap.add_argument("--repcheck", action="store_true", help="check for repeated byte sequences")
-    ap.add_argument("--metadata", action="store_true", help="include MP3 metadata as seed")
-    args = ap.parse_args()
+def autocorr_test(bits: np.ndarray) -> tuple[float, bool]:
+    n = len(bits) - 1
+    x = bits[:-1].astype(np.float32) - bits[:-1].mean()
+    y = bits[1:].astype(np.float32) - bits[1:].mean()
+    r = float(np.dot(x, y) / np.sqrt(np.dot(x, x) * np.dot(y, y) + 1e-12))
+    return r, abs(r) < 0.02
 
-    for p in args.input:
+
+def byte_chi2_test(data: bytes) -> tuple[float, bool, float]:
+    """Uniformity of the packed byte stream. z ~ N(0,~1); |z|<3 => passes."""
+    freqs = np.bincount(np.frombuffer(data, dtype=np.uint8), minlength=256)
+    n = len(data)
+    exp = n / 256.0
+    chi2 = float(np.sum((freqs - exp) ** 2 / exp))
+    z = np.sqrt(2 * chi2) - np.sqrt(2 * 255 - 1)
+    pmin = float(-np.log2(freqs.max() / n))  # min-entropy (bits / byte)
+    return z, abs(z) < 3.0, pmin
+
+
+def gen_from_audio(
+    files: list[str],
+    method: str,
+    nbits: int,
+    highpass: float,
+    debias: bool,
+    nbytes: int | None,
+):
+    """Load & merge all files -> raw bits -> packed bytes.
+
+    Returns (dur_s, bits, data_bytes, per_file_info). nbytes=None returns
+    everything; otherwise returns at most nbytes (raises if too little).
+    """
+    y_parts, infos, dur = [], [], 0.0
+    for p in files:
         if not Path(p).exists():
-            print(f"error: file not found: {p}", file=sys.stderr)
-            sys.exit(1)
-
-    if len(args.input) > 1:
-        print(f"merging {len(args.input)} audio files for combined entropy")
-
-    seed_bytes = b""
-    if args.seed:
-        seed_bytes += args.seed.encode()
-
-    if args.metadata:
-        for p in args.input:
-            meta = extract_mp3_metadata(p)
-            seed_bytes += meta
-            if meta:
-                print(f"  metadata from {Path(p).name}: bitrate={struct.unpack('>I', meta[:4])[0]}bps")
-
-    y_parts = []
-    for p in args.input:
+            sys.exit(f"error: file not found: {p}")
         y = load_audio(p)
-        dur = len(y) / 22050
-        name = Path(p).name
-        print(f"  {name}: {dur:.1f}s, {len(y)} samples")
-        if args.highpass:
-            y = highpass_filter(y, args.highpass)
+        y = trim_silence(y)  # drop no-entropy lead-in/tail (MP3 zeros, silence)
+        dur += len(y) / SR
+        if highpass:
+            y = highpass_filter(y, highpass)
         y_parts.append(y)
+        infos.append(file_fingerprint(p))
+        print(f"  {Path(p).name}: {len(y)/SR:.1f}s, {len(y)} samples")
 
     y = np.concatenate(y_parts)
-    if len(args.input) > 1:
-        print(f"  total: {len(y)} samples")
-
-    print(f"extracting: method={args.method}, nbits={args.nbits}")
-    bits = extract_raw_bits(y, args.method, args.nbits)
-    print(f"  raw bits: {len(bits)}")
-
-    if args.debias:
+    bits = extract_raw_bits(y, method, nbits)
+    if debias:
         bits = von_neumann_debias(bits)
-        print(f"  after debias: {len(bits)}")
+    data = np.packbits(bits).tobytes()
+    if nbytes is not None and len(data) < nbytes:
+        sys.exit(
+            f"error: need {nbytes} bytes of entropy but only {len(data)} "
+            f"available ({len(data) * 8} bits from {dur:.0f}s audio). "
+            f"Add more/longer mp3 files."
+        )
+    if nbytes is not None:
+        data = data[:nbytes]
+    return dur, bits, data, infos
 
-    # Enough SHA-256 blocks (=256 bits each) for the requested uint32 count
-    # AND, if an image is requested, for the full W*H*8 bits of image data.
-    # Otherwise bits_to_image() re-tiles a short digest -> barcode pattern.
-    count_bits = args.count * 32
-    image_bits = 0
-    if args.image:
-        image_bits = args.image_size[0] * args.image_size[1] * 8
-    blocks = max(1, (count_bits + 255) // 256, (image_bits + 255) // 256)
-    digest = hash_condition(bits, seed_bytes, blocks=blocks)
-    out_bits = np.unpackbits(np.frombuffer(digest, dtype=np.uint8))
+
+def bits_to_uint32(bits: np.ndarray) -> list[int]:
+    flat = bits[: len(bits) - (len(bits) % 32)]
+    packed = np.packbits(flat.reshape(-1, 32)[:, :32])
+    return [struct.unpack(">I", packed[i : i + 4])[0] for i in range(0, len(packed), 4)]
+
+
+def detect_repetition(data: bytes, window: int = 16) -> list[tuple[int, int, int]]:
+    repeats, seen = [], {}
+    for i in range(len(data) - window + 1):
+        chunk = data[i : i + window]
+        if chunk in seen:
+            repeats.append((seen[chunk], i, i - seen[chunk]))
+        else:
+            seen[chunk] = i
+    return repeats
+# ---------------------------------------------------------------------------
+# Image helpers
+# ---------------------------------------------------------------------------
+def _require_pil():
+    if Image is None:
+        sys.exit("error: Pillow not installed. run: uv add Pillow")
+
+
+def save_keystream_png(data: bytes, size: tuple[int, int], out: str):
+    _require_pil()
+    needed = size[0] * size[1]
+    if len(data) < needed:
+        sys.exit(f"error: need {needed} bytes for a {size[0]}x{size[1]} image, only {len(data)} available")
+    arr = np.frombuffer(data[:needed], dtype=np.uint8).reshape(size)
+    Image.fromarray(arr, mode="L").save(out)
+    print(f"  saved random grayscale key image: {out} ({size[0]}x{size[1]})")
+
+
+def load_plane(path: str) -> tuple[np.ndarray, str]:
+    _require_pil()
+    img = Image.open(path)
+    if img.mode not in ("L", "RGB", "RGBA"):
+        img = img.convert("RGB")
+    return np.array(img), img.mode
+
+
+def xor_with_key(plane: np.ndarray, key: bytes) -> np.ndarray:
+    flat = plane.ravel().astype(np.uint8)
+    k = np.frombuffer(key, dtype=np.uint8)
+    if len(k) < len(flat):
+        sys.exit(f"error: key too short ({len(k)} bytes) for image ({len(flat)} bytes)")
+    return np.bitwise_xor(flat, k[: len(flat)]).reshape(plane.shape)
+
+
+def encryption_metrics(plain: np.ndarray, cipher: np.ndarray) -> dict:
+    p = plain.ravel().astype(np.float64)
+    c = cipher.ravel().astype(np.float64)
+    corr = float(np.corrcoef(p, c)[0, 1])
+    freqs = np.bincount(cipher.ravel(), minlength=256)
+    n = c.size
+    exp = n / 256.0
+    chi2 = float(np.sum((freqs - exp) ** 2 / exp))
+    z = np.sqrt(2 * chi2) - np.sqrt(2 * 255 - 1)
+    pmin = float(-np.log2(freqs.max() / n))
+    return {"corr": corr, "chi2_z": z, "min_entropy": pmin}
+
+
+# ---------------------------------------------------------------------------
+# Shared extraction CLI args
+# ---------------------------------------------------------------------------
+def add_extract_args(p):
+    p.add_argument("-m", "--method", choices=METHODS, default="mixed",
+                   help="lsb/diff/zero_cross/adc_noise, or 'mixed' (default): XOR of three physical views")
+    p.add_argument("-n", "--nbits", type=int, default=1, help="bits per sample (1-4)")
+    p.add_argument("--highpass", type=float, default=0.0,
+                   help="highpass cutoff Hz per file (0 = off; usually not needed)")
+    p.add_argument("--debias", action="store_true", help="von Neumann debiasing (halves data)")
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+def cmd_gen(args):
+    dur, bits, data, infos = gen_from_audio(
+        args.input, args.method, args.nbits, args.highpass, args.debias, None
+    )
+    print(f"  merged: {dur:.1f}s audio -> {len(bits)} raw bits = {len(data)} bytes")
+
+    if args.metadata:
+        for info in infos:
+            print(f"  {info['file']}: bitrate={info.get('bitrate', '?')}bps, "
+                  f"sr={info.get('sample_rate', '?')}Hz, size={info['bytes']}B")
 
     if args.test:
-        print("\n--- randomness tests (NIST SP 800-22 style) ---")
-        m_stat, m_pass = monobit_test(out_bits)
-        print(f"  monobit (freq): stat={m_stat:.4f}  {'PASS' if m_pass else 'FAIL'}")
-        r_stat, r_pass = runs_test(out_bits)
-        print(f"  runs:           stat={r_stat:.4f}  {'PASS' if r_pass else 'FAIL'}")
-        pi = np.mean(out_bits)
-        print(f"  P(1) = {pi:.4f}  (ideal: 0.5)")
+        print("\n--- randomness tests (on RAW extracted bits, NO conditioning) ---")
+        m, mp = monobit_test(bits)
+        r, rp = runs_test(bits)
+        ac, acp = autocorr_test(bits)
+        z, zp, pmin = byte_chi2_test(data)
+        print(f"  monobit (freq):    stat={m:8.4f}  {'PASS' if mp else 'FAIL'}")
+        print(f"  runs:              stat={r:8.4f}  {'PASS' if rp else 'FAIL'}")
+        print(f"  autocorr (lag 1):  r   ={ac:+8.4f}  {'PASS' if acp else 'FAIL'}")
+        print(f"  byte uniformity:   z   ={z:+8.2f}  {'PASS' if zp else 'FAIL'}")
+        print(f"  P(1) = {bits.mean():.4f}   (ideal 0.5)")
+        print(f"  min-entropy = {pmin:.4f} bits/byte   (8.0 = fully random)")
 
     if args.image:
-        bits_to_image(out_bits, tuple(args.image_size), args.image)
+        save_keystream_png(data, tuple(args.image_size), args.image)
 
     if args.repcheck:
-        data = np.packbits(out_bits).tobytes()
-        repeats = detect_repetition(data)
-        if repeats:
-            print(f"\n--- repetition check: {len(repeats)} repeats found ---")
-            for first, second, dist in repeats[:10]:
-                print(f"  at offset {first} repeats at {second} (distance={dist})")
-            if len(repeats) > 10:
-                print(f"  ... and {len(repeats)-10} more")
+        reps = detect_repetition(data)
+        if reps:
+            print(f"\n--- repetition check: {len(reps)} repeated 16-byte windows (first: offset {reps[0][0]}) ---")
         else:
             print("\n--- repetition check: no repeated 16-byte windows ---")
 
-    nums = bits_to_uint32(out_bits[: args.count * 32])
-    print(f"\n--- {len(nums)} random uint32s ---")
+    if args.out:
+        Path(args.out).write_bytes(data)
+        print(f"  wrote {len(data)} random bytes -> {args.out}")
+
+    nums = bits_to_uint32(bits[: args.count * 32])
+    print(f"\n--- {len(bits) // 32} uint32s total, showing {len(nums)} ---")
     for n in nums:
         print(n)
+
+
+def cmd_encrypt(args):
+    plain, mode = load_plane(args.plain)
+    nbytes = plain.size * plain.itemsize
+    dur, bits, key, infos = gen_from_audio(
+        args.input, args.method, args.nbits, args.highpass, args.debias, nbytes
+    )
+    print(f"  keystream: {len(key)} bytes from {dur:.1f}s audio")
+    if args.metadata:
+        for info in infos:
+            print(f"  {info['file']}: bitrate={info.get('bitrate', '?')}bps, "
+                  f"sr={info.get('sample_rate', '?')}Hz, size={info['bytes']}B")
+
+    cipher = xor_with_key(plain, key)
+    Image.fromarray(cipher, mode=mode).save(args.output)
+    if args.key_image:
+        save_keystream_png(key, (512, 512), args.key_image)
+
+    met = encryption_metrics(plain, cipher)
+    print(f"\n  encrypted {Path(args.plain).name} ({mode}) -> {args.output}")
+    print(f"  plain<->cipher correlation: {met['corr']:+.4f}   (0 = no relation, ideal)")
+    print(f"  cipher byte uniformity z:   {met['chi2_z']:+.2f}  (PASS if |z| < 3)")
+    print(f"  cipher min-entropy:         {met['min_entropy']:.4f} bits/byte   (8.0 ideal)")
+
+
+def cmd_decrypt(args):
+    cipher, mode = load_plane(args.input_file)
+    nbytes = cipher.size * cipher.itemsize
+    dur, bits, key, _ = gen_from_audio(
+        args.random, args.method, args.nbits, args.highpass, args.debias, nbytes
+    )
+    plain = xor_with_key(cipher, key)
+    Image.fromarray(plain, mode=mode).save(args.output)
+    print(f"  decrypted {Path(args.input_file).name} ({mode}) -> {args.output}")
+    if args.verify:
+        ref, _ = load_plane(args.verify)
+        same = bool(np.array_equal(ref, plain))
+        print(f"  round-trip vs {Path(args.verify).name}: {'IDENTICAL' if same else 'MISMATCH'}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    g = sub.add_parser("gen", help="extract random numbers from audio files")
+    g.add_argument("input", nargs="+", help="audio files (pass 5-10 for a bigger entropy pool)")
+    add_extract_args(g)
+    g.add_argument("-c", "--count", type=int, default=64, help="uint32s to print")
+    g.add_argument("--image", type=str, help="save keystream as grayscale PNG")
+    g.add_argument("--image-size", type=int, nargs=2, default=(512, 512), metavar=("W", "H"))
+    g.add_argument("--out", type=str, help="also write full random bytes to this file")
+    g.add_argument("--test", action="store_true", help="run randomness tests on raw bits")
+    g.add_argument("--repcheck", action="store_true", help="check for repeated 16-byte windows")
+    g.add_argument("--metadata", action="store_true", help="print mp3 fingerprint info")
+    g.set_defaults(fn=cmd_gen)
+
+    e = sub.add_parser("encrypt", help="encrypt an image by XOR with audio-derived keystream")
+    e.add_argument("input", nargs="+", help="audio key sources (use the same ones to decrypt)")
+    add_extract_args(e)
+    e.add_argument("-i", "--plain", required=True, help="input (plaintext) image")
+    e.add_argument("-o", "--output", required=True, help="output cipher image")
+    e.add_argument("--key-image", type=str, help="optional: save 512x512 keystream visualization")
+    e.add_argument("--metadata", action="store_true")
+    e.set_defaults(fn=cmd_encrypt)
+
+    d = sub.add_parser("decrypt", help="decrypt a cipher image (same audio = same keystream)")
+    d.add_argument("random", nargs="+", help="same audio files used for encryption")
+    add_extract_args(d)
+    d.add_argument("-i", "--input_file", required=True, help="cipher image")
+    d.add_argument("-o", "--output", required=True, help="recovered image")
+    d.add_argument("--verify", type=str, help="optional plaintext image to verify exact recovery")
+    d.set_defaults(fn=cmd_decrypt)
+
+    args = ap.parse_args()
+    args.fn(args)
 
 
 if __name__ == "__main__":

@@ -1,170 +1,145 @@
 # audio-trng
 
-Generate **true random numbers** from the entropy hidden in natural audio recordings (e.g. bird chirps). No PRNG seeds — randomness comes from ADC quantization noise, environmental noise, and non-deterministic signal content.
+**True Random Number Generator from natural audio (bird chirps) — with image encryption demo.**
 
-## What this does
+Randomness comes **only** from physical processes in the signal: ADC quantization
+noise, environmental noise, and non-stationary content. There is **no
+cryptographic conditioning** (no SHA-256) anywhere in the pipeline — the raw
+extracted bits pass the statistical tests on their own, so the randomness is
+attributable to the extraction method, not a hash.
 
-```
-bird chirp.mp3 ──► entropy extraction ──► debias / condition ──► random bits
-                                                              ├─► uint32 stream
-                                                              ├─► 512×512 grayscale image
-                                                              └─► NIST SP 800-22 self-tests
-```
-
-## Why audio works as entropy source
-
-- **ADC quantization noise** — the lowest 1–2 bits of every 16-bit sample are sub-bit electrical noise, not signal
-- **Environmental noise** — microphone thermal hiss, air pressure fluctuations
-- **Non-stationary signal** — a bird chirp is aperiodic and frequency-modulated, unlike a computer-generated tone
-- **MP3 lossy artifacts** — encoder psychoacoustic decisions are content-dependent and non-reproducible
-
-## Quick start
-
-```bash
-uv sync
-uv run python main.py chirp.mp3 -m diff --debias --hash --test
-```
-
-## Usage
-
-```bash
-uv run python main.py chirp.mp3 -n 2 -m diff --highpass 4000 --debias --hash \
-    --test --metadata --image random.png --repcheck -c 16
-```
-
-| Flag | Default | Purpose |
-|---|---|---|
-| `input` | — | audio file(s); pass multiple to merge entropy |
-| `-n` | `1` | bits per sample to extract (1–16) |
-| `-m` | `diff` | extraction method: `lsb`, `diff`, `zero_cross`, `adc_noise` |
-| `-c` | `256` | number of 32-bit integers to output |
-| `--highpass` | `0` | HPF cutoff Hz; strips structured content, keeps noise floor |
-| `--debias` | off | von Neumann debiasing (removes bias, discards ~50% bits) |
-| `--hash` | off | SHA-256 conditioning (cryptographic entropy extraction) |
-| `--test` | off | NIST SP 800-22-style monobit + runs tests |
-| `--seed` | — | extra seed string mixed into conditioner |
-| `--metadata` | off | hash MP3 metadata (bitrate/samplerate/ID3 tags) as seed |
-| `--image` | — | save random bytes as grayscale image (e.g. `random.png`) |
-| `--image-size` | `512 512` | image dimensions W×H |
-| `--repcheck` | off | scan output for repeated 16-byte windows |
-
-## Pipeline
+## What it does
 
 ```mermaid
 flowchart LR
-    A[MP3 input] --> B[librosa load<br/>mono 22kHz PCM]
-    B --> C{highpass?}
-    C -->|yes| D[Butterworth HPF @ 4kHz<br/>keep noise floor]
-    C -->|no| E[extract bits]
-    D --> E
-    E --> F[extraction method]
-    F --> G[lsb: sample LSBs]
-    F --> H[diff: sample-to-sample deltas]
-    F --> I[zero_cross: interval parity]
-    F --> J[adc_noise: low-bit XOR]
-    G --> K{debias?}
-    H --> K
-    I --> K
-    J --> K
-    K -->|yes| L[von Neumann<br/>discard 00/11]
-    K -->|no| M[conditioning]
-    L --> M
-    M --> N[SHA-256 hash]
-    M --> O[raw bits]
-    N --> P[random bits]
-    O --> P
-    P --> Q[uint32 output]
-    P --> R[grayscale image]
-    P --> S[self-tests]
+    A[chirp1.mp3] ~~~ B[chirp2.mp3]
+    C[chirpN.mp3] --> M[merge + silence trim]
+    A --> M
+    B --> M
+    M --> D["entropy extraction<br/>(mixed / diff)"]
+    D --> E["optional debias<br/>(von Neumann)"]
+    E --> F{use case}
+    F -->|gen| G[uint32 stream]
+    F -->|gen| H[grayscale key image]
+    F -->|encrypt| I["cipher.png = plain XOR keystream"]
+    F -->|decrypt| J["plain.png = cipher XOR keystream"]
 ```
 
-## Entropy extraction methods
+## Why no SHA-256?
 
-```mermaid
-graph LR
-    subgraph signal
-        A[16-bit sample<br/>0b0110...**10**]
-    end
-    A --> B[MSBs = signal<br/>chirp content]
-    A --> C[LSBs = noise<br/>thermal + ADC]
-    C --> D[diff method:<br/>delta between samples]
-    C --> E[lsb method:<br/>lowest bits]
-    D --> F[bits]
-    E --> F
-```
+A hash can turn *anything* (even a deterministic pattern) into random-looking
+output — so conditioning would make the result indistinguishable from a PRNG
+and the physical source would be irrelevant. Here the **method** must do the
+work: `mixed` / `diff` extraction passes frequency, runs, autocorrelation, and
+byte-uniformity tests on raw bits from real recordings. Namely:
 
-## How entropy is extracted
+| method | raw monobit | raw runs | raw autocorr | raw byte-uniformity |
+|---|---|---|---|---|
+| `mixed` (default) | PASS | PASS | PASS | PASS |
+| `diff` | PASS | PASS | PASS | PASS |
+| `lsb` | FAIL | FAIL | PASS | FAIL |
+| `adc_noise` | FAIL | FAIL | PASS | PASS |
+| `zero_cross` | FAIL | FAIL | FAIL | FAIL |
 
-For a 16-bit sample `0b0011010100101101`:
-- **Upper bits** carry the signal (the chirp shape)
-- **Lower bits** carry noise (ADC + environmental)
+Weak methods are honestly reported and recoverable in most cases with
+`--debias` (e.g. `lsb+--debias` passes everything). Output min-entropy is
+≈ **7.9 bits/byte** (~8.0 ideal) on raw bits.
 
-The `diff` method looks at `sample[i] - sample[i-1]` — instantaneous voltage fluctuation, dominated by physical noise rather than chirp content.
-
-The highpass filter (`--highpass 4000`) strips the structured 1–4kHz bird song, leaving mostly electronic noise floor as entropy.
-
-## Randomness validation
-
-Runs NIST SP 800-22-style tests:
-
-```mermaid
-sequenceDiagram
-    participant A as extractor
-    participant B as SHA-256
-    participant C as tests
-    A->>B: raw bits
-    B->>C: conditioned bits
-    C->>C: monobit test (P(1)≈0.5)
-    C->>C: runs test (run-length distribution)
-    C-->>user: PASS / FAIL
-```
-
-- **Monobit** — proportion of 1s close to 0.5 (`|stat| < 3.29`)
-- **Runs** — sequences of consecutive identical bits match expected distribution
-- **Repetition check** — no repeated 16-byte windows (non-periodicity)
-
-## Output as image
+## Install & run
 
 ```bash
-uv run python main.py chirp.mp3 -m diff --debias --hash --image random.png
+uv sync
+# random numbers (default = mixed method, raw bits, no hashing)
+uv run python main.py gen chirp1.mp3 chirp2.mp3 ... --test -c 16
+
+# 512x512 random image
+uv run python main.py gen chirp1.mp3 chirp2.mp3 --test --image random.png
+
+# encrypt an image with the audio-derived keystream
+uv run python main.py encrypt chirp1.mp3 chirp2.mp3 -i photo.png -o cipher.png
+
+# decrypt (same audio files = same keystream)
+uv run python main.py decrypt chirp1.mp3 chirp2.mp3 -i cipher.png -o recovered.png
 ```
 
-Packs random bits into bytes → arranges as 512×512 array → grayscale PNG.
-A good TRNG output looks like uniform TV static; any visible structure = bias.
+Pass **5–10 mp3 files** for a bigger entropy pool; more minutes of audio = more
+random bytes (one 512×512 image needs ~262 KB ≈ 20 s of chirp audio).
 
-## Multiple inputs
-
-```bash
-uv run python main.py chirp.mp3 ambience.mp3 -m diff --debias --hash --test
-```
-
-Concatenates waveforms — larger entropy pool dilutes any single-file artifacts.
-
-## Validation run (this repo)
+## CLI
 
 ```
-monobit: stat=1.6250  PASS
-runs:    stat=0.3385  PASS
-P(1) = 0.4492  (ideal: 0.5)
-no repeated 16-byte windows
+main.py {gen,encrypt,decrypt}
+
+gen      input...            → uint32 stream, optional image / raw bytes
+encrypt  input... -i IMG -o  → cipher.png       (+ key-image visualization)
+decrypt  input... -i IMG -o  → recovered plain.png
+
+shared extraction options:
+  -m, --method   mixed | lsb | diff | adc_noise | zero_cross   (default mixed)
+  -n, --nbits    bits per sample (1-4)                          (default 1)
+  --highpass     butterworth highpass cutoff Hz                  (default 0)
+  --debias       von Neumann debiasing (halves data volume)
 ```
 
-## Architecture
+`gen` extras: `-c N` print N uint32s · `--test` run randomness tests ·
+`--image file.png [--image-size W H]` · `--out random.bin` · `--repcheck` ·
+`--metadata` print mp3 fingerprint (info only).
+
+## Entropy extraction
+
+For a 16-bit sample `0b0011010100101101`, the upper bits carry the chirp shape;
+the lowest bits carry ADC/environmental noise.
+
+`mixed` XORs three complementary physical views per sample:
+`((y & 1) ^ (Δy & 1) ^ ((y>>2) & 1))` — raw LSBs, sample-difference LSBs, and
+the shifted bit plane. Bias or correlation present in any single view cancels,
+so the combined stream passes the tests with no conditioning.
+
+## Image encryption (paper-style)
+
+Using the keystream exactly once per pixel and XOR-ing (as in the SCAN-image
+papers this project was inspired by):
+
+| metric (from demo run) | value | ideal |
+|---|---|---|
+| plain ⇄ cipher correlation | **-0.0014** | 0 |
+| cipher byte uniformity z | **+0.83** | \|z\| < 3 |
+| cipher min-entropy | **7.87 bits/byte** | 8.0 |
+
+The keystream is deterministic in the audio files + extraction parameters, so
+`decrypt` reproduces it exactly. Changing any parameter (or audio file) yields a
+completely different keystream and the image **cannot** be recovered — verified
+in the demo (`demo/`).
+
+## Pipeline detail
+
+```mermaid
+flowchart TD
+    A[mp3 files] --> B["librosa mono 22.05 kHz"]
+    B --> C["trim_silence: drop no-entropy<br/>lead-in/tail (MP3 zeros)"]
+    C --> D["extract_raw_bits(method)"]
+    D --> E{"--debias?"}
+    E -->|yes| F["von Neumann: keep 01→0,10→1"]
+    F --> G["np.packbits → bytes"]
+    E -->|no| G
+    G --> H[uint32 stream / key image / keystream]
+```
+
+## Repo layout
 
 ```
-├── main.py        # CLI + pipeline
-├── chirp.mp3      # sample entropy source
-├── random.png     # generated output (512×512 grayscale)
-├── diagrams/      # architecture diagrams
-└── pyproject.toml # uv project
+main.py       # CLI: gen / encrypt / decrypt
+chirp.mp3     # sample source (gitignored — supply your own recordings)
+demo/         # plain / cipher / key / recovered demo images
+pyproject.toml
 ```
 
 ## Limitations
 
-- Highpass + debiasing + hashing needed for reliable statistical pass; raw LSB bits alone are weakly biased
-- `zero_cross` method alone fails statistical tests (use with `--hash`)
-- Output is as good as the entropy source — a silent or synthetic (tone) input yields poor randomness
-
-## Dependencies
-
-librosa · numpy · scipy · soundfile · mutagen · Pillow · matplotlib
+- Output volume is bounded by source entropy: silence yields nothing (trimmed),
+  and too little audio for a requested image/keystream is a hard error.
+- `zero_cross` (and to some extent `lsb`, `adc_noise`) are weak alone — use the
+  default `mixed` or `diff`, or add `--debias`.
+- Plain XOR is a demonstrative cipher, not a construction to ship for real use;
+  XOR with proper keystreams is how the TRNG-vs-encryption academic papers wire
+  it together.
