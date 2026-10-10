@@ -173,7 +173,7 @@ requirement maps to.)*
 | [27] | Stinson, 2002 | Universal hash families & Leftover Hash Lemma | Theory | Hashing can preserve min-entropy exactly | Theoretical; needs a uniform seed |
 | [28] | Choi et al., 2023 | Practical entropy accumulation | Theory | Valid bound for accumulated output | Assumes independent blocks |
 | [29] | Dang et al., 2025 | High-throughput extractor post-processing | TCHES hardware | Fast, provable extractors | Hardware; still post-processing |
-| [30] | Crocetti et al., 2023 | Review of RNG assessment metrics | Survey | Maps statistical vs information-theoretic tests | Survey; no acoustic application |
+| [30] | Vrana, Lou & Kuang, 2025 | QPP-RNG: system-jitter TRNG evaluated with NIST 800-90B/800-22 | Commodity CPUs (Windows/macOS/Raspberry Pi) | IID min-entropy 7.85–7.95 bits/byte; beats several commercial RNGs | System jitter only; no acoustic case, no discard-only gate |
 | [31] | Li et al., 2020 | Deep-learning security verification of an NRNG | Deep learning | ML finds weaknesses tests miss | Attack-oriented; needs many samples |
 | [32] | Truong et al., 2019 | ML cryptanalysis of a quantum RNG | LSTM | Environmental leakage can be learned | Side-channel issue, not a core QRNG flaw |
 | [33] | Castillo et al., 2026 | Automated web framework for SP 800-22 | MDPI *IoT* | Reproducible testing made easy | Tooling; no new entropy method |
@@ -185,9 +185,9 @@ requirement maps to.)*
 
 | Ref | Author(s), Year | Method | Dataset / Tools | Key finding | Limitation |
 |---|---|---|---|---|---|
-| [37] | Zhang et al., 2023 | Review of chaos-based image encryption | Survey | Maps the field, apps and challenges | Many schemes later broken |
+| [37] | Zhang, Chai, Xiang & Li, 2025 | Image encryption with multi-level keys from a 6D memristive chaotic system | Simulation (256×256 test images) | Entropy 7.9979, NPCR 99.61%, UACI 33.46% | Deterministic chaos + SHA-256 key, not physical entropy |
 | [38] | Alawida et al., 2023 | Chaos-based permutation for images | Simulation | Good diffusion & confusion | Chaos key handling; CPA concerns |
-| [39] | Alghamdi, Munir & Ahmad, 2024 | Survey of image-encryption design & metrics | Survey | Fixes the standard metric set | Little attack analysis |
+| [39] | Liao, Lin, Li, Xing & Yuan, 2025 | Lightweight 4D-NDS image encryption (single-round compound diffusion) | Simulation | Good NPCR/UACI at low cost, IEEE Access 2025 | Chaos-derived keystream; no true-randomness source |
 | [40] | Wang et al., 2018 | Chosen-plaintext attack on a 1D chaotic cipher | CPA | Scheme fully broken | Motivates plaintext-linked keystreams |
 | [41] | Zhu, Sun et al., 2018 | Improved cryptanalysis of a chaos cipher | CPA | Key recovered from few plaintexts | "Security at build time" only |
 | [42] | Zhu et al., 2023 | Fractional chaotic map + parallel DNA coding | Simulation | High throughput, good entropy | DNA-coding assumptions; key management |
@@ -338,7 +338,7 @@ Each gap is drawn straight from the comparison tables in §6.
 
 - **G4 — Evaluation is inconsistent and usually done only after conditioning.**
   Many works report SP 800-22 on processed output, short sequences, or skip two-level
-  interpretation [22,25,30]; some rely on ML to find weaknesses [31,32].
+  interpretation [22,25]; some rely on ML to find weaknesses [31,32].
   *Gap: end-to-end, reproducible validation on **raw, unconditioned** bits with explicit
   thresholds and sequence lengths.*
 
@@ -350,7 +350,7 @@ Each gap is drawn straight from the comparison tables in §6.
 
 - **G6 — Throughput and practicality are rarely benchmarked against standard baselines.**
   Sensor/acoustic works seldom state clean bits per second or compare against OS/PRNG/CSPRNG
-  baselines [13,14,34]. *Gap: a quantified throughput (clean entropy bits/s) and a statistical
+  baselines [13,14,34] — even though a 2025 system-jitter TRNG already benchmarks itself against commercial entropy sources [30]. *Gap: a quantified throughput (clean entropy bits/s) and a statistical
   comparison against `os.urandom` / AES-CTR DRBG.*
 
 ---
@@ -545,7 +545,7 @@ APA style before the final report (20-author limit).*
 
 [29] Dang, Y., Grujić, M., Yang, B., Zhu, W., Wang, H., Zhu, M., Verbauwhede, I., & Liu, L. (2025). Entropy extractor based high-throughput post-processings for True Random Number Generators. *IACR Transactions on Cryptographic Hardware and Embedded Systems, 2025*(4), 1–26.
 
-[30] Crocetti, L., et al. (2023). Review of methodologies and metrics for assessing the quality of random number generators. *Electronics, 12*(3), 723. https://doi.org/10.3390/electronics12030723
+[30] Vrana, G., Lou, D., Kuang, R., et al. (2025). Raw QPP-RNG randomness via system jitter across platforms: a NIST SP 800-90B evaluation. *Scientific Reports, 15*. https://doi.org/10.1038/s41598-025-13135-8 †
 
 [31] Li, C., et al. (2020). Deep learning-based security verification for a random number generator. *IEEE Access, 8*, 170609–170621. https://doi.org/10.1109/ACCESS.2020.3024757 †
 
@@ -561,11 +561,11 @@ APA style before the final report (20-author limit).*
 
 ### Theme 3 — Cryptographic applications & RNG security
 
-[37] Zhang, B., et al. (2023). Chaos-based image encryption: Review, application, and challenges. *Mathematics, 11*(11), 2585. https://doi.org/10.3390/math11112585
+[37] Zhang, X., Chai, Y., Xiang, S., & Li, S. (2025). Research on image encryption with multi-level keys based on a six-dimensional memristive chaotic system. *Entropy, 27*(11), 1152. https://doi.org/10.3390/e27111152
 
 [38] Alawida, M., et al. (2023). A novel chaos-based permutation for image encryption. *Journal of King Saud University – Computer and Information Sciences, 35*(6), 101595. https://doi.org/10.1016/j.jksuci.2023.101595 †
 
-[39] Alghamdi, Y., Munir, M., & Ahmad, J. (2024). Image encryption algorithms: A survey of design and evaluation metrics. *Journal of Cybersecurity and Privacy, 4*(1), 7. https://doi.org/10.3390/jcp4010007
+[39] Liao, Y., Lin, Y., Li, Q., Xing, Z., & Yuan, X. (2025). Lightweight image encryption algorithm using 4D-NDS: compound dynamic diffusion and single-round efficiency. *IEEE Access, 13*, 74656-74666. https://doi.org/10.1109/ACCESS.2025.3560686
 
 [40] Wang, H., et al. (2018). Cryptanalysis and enhancements of image encryption using combination of the 1D chaotic map. *Signal Processing, 144*, 444–452. https://doi.org/10.1016/j.sigpro.2017.11.005 †
 
@@ -637,12 +637,13 @@ Lemma [27]; deep-learning RNG verification [31,32]; the Debian OpenSSL RNG failu
 chaos-cipher cryptanalyses [40,41]; chaotic speech encryption [51]. Every one is a recognised
 foundational or normative work, not a recent result.
 
-**Survey/review papers removed in this revision** (their "Dataset/Tools" column was simply
-"Survey"): Cao et al. (2022), Gong et al. (2019), Herrero-Collantes & Garcia-Escartin (2017),
-Zhao et al. (2024), Chai et al. (2025), Sharma, Naz & Shah (2026), plus conference/ePrint items
-that added no method — total 16 references removed (72 → 56): 6 journal surveys/reviews and 10 conference/ePrint items. Three recent reviews are kept
-because each *defines* a theme: [30] RNG metrics, [37] chaos image encryption, [39]
-image-encryption evaluation metrics.
+**Survey/review papers removed** (their "Dataset/Tools" column was simply "Survey"): Cao et al.
+(2022), Gong et al. (2019), Herrero-Collants & Garcia-Escartin (2017), Zhao et al. (2024),
+Chai et al. (2025), Sharma, Naz & Shah (2026) — plus 10 conference/ePrint items: **16 references
+removed (72 → 56)**. A further **3 review articles** that had survived that pass (RNG-metrics
+review, chaos image-encryption review, image-encryption metrics survey) were **replaced in place
+by 2025 original research** — Vrana et al. [30], Zhang et al. [37], Liao et al. [39]. **All nine
+survey papers from the original 72 are gone; no Dataset = "Survey" row remains.**
 
 ## Appendix B — Open items before submission
 
