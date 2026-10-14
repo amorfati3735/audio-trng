@@ -23,3 +23,7 @@ keystream*.png
 
 # Large input / derived images
 photo*.png
+
+# IDP review reference PDFs (official templates/rubrics/guidelines)
+idp review 1/*.pdf
+1. IDP Review 1 template.pdf
