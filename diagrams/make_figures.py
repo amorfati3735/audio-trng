@@ -5,7 +5,9 @@ rsvg-convert) for the audio-TRNG IDP presentation.
 One shared palette and typographic scale are used across every figure so the
 set reads like figures from a single paper.
 
-Run:  python3 diagrams/make_figures.py
+Run:  uv run python diagrams/make_figures.py
+SVGs are always written; PNG export needs rsvg-convert (gracefully skipped
+with a hint when it is not installed, e.g. on a fresh Windows box).
 """
 from __future__ import annotations
 
@@ -14,6 +16,7 @@ import subprocess
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+_PNG_WARNED = False  # print the missing-rsvg hint only once
 
 # ----------------------------------------------------------------------------
 # Palette (muted, print-safe; one accent family per semantic role)
@@ -165,9 +168,19 @@ def save(svg: SVG, name: str, scale: float = 2.0):
     sfile = HERE / f"{name}.svg"
     sfile.write_text(svg.figure(), encoding="utf-8")
     png = HERE / f"{name}.png"
-    subprocess.run(["rsvg-convert", "-z", str(scale), str(sfile), "-o", str(png)],
-                   check=True)
-    print(f"  wrote {name}.svg + {name}.png")
+    try:
+        subprocess.run(["rsvg-convert", "-z", str(scale), str(sfile), "-o", str(png)],
+                       check=True)
+        print(f"  wrote {name}.svg + {name}.png")
+    except FileNotFoundError:
+        global _PNG_WARNED
+        if not _PNG_WARNED:
+            print("  note: 'rsvg-convert' not found - PNG export skipped, "
+                  "SVGs written instead.\n"
+                  "        install librsvg to get PNGs "
+                  "(pacman -S librsvg / winget install GNOME.GtkForWindows_librsvg)")
+            _PNG_WARNED = True
+        print(f"  wrote {name}.svg")
 
 
 def panel(x, y, w, h, title, accent, tag=None):

@@ -75,6 +75,28 @@ uv run python main.py encrypt chirp1.mp3 chirp2.mp3 -i photo.png -o cipher.png
 uv run python main.py decrypt chirp1.mp3 chirp2.mp3 -i cipher.png -o recovered.png
 ```
 
+### Windows
+
+Works the same — all dependencies ship Windows wheels (no compilers, no
+system libraries). In PowerShell:
+
+```powershell
+# one-time: install uv (pick one)
+winget install astral-sh.uv        # or: scoop install uv
+
+cd C:\Users\DELL\source\repos\audio-trng
+uv sync                            # creates .venv, installs deps (fetches Python 3.12 if needed)
+
+uv run python main.py gen chirp.mp3 --test -c 16
+uv run python main.py encrypt chirp.mp3 -i photo.png -o cipher.png
+uv run python main.py decrypt chirp.mp3 -i cipher.png -o recovered.png
+```
+
+Quote any path containing spaces (`"idp review 1\..."`). Line endings are
+pinned to LF via `.gitattributes`, so commits are identical from either OS.
+`diagrams/make_figures.py` also runs on Windows; only its PNG export step is
+skipped when `rsvg-convert` is absent (the SVGs are always written).
+
 Pass several mp3 files for a bigger entropy pool. Throughput is honest:
 roughly **32 kbits/s (4 KB/s) of clean entropy** for this pool. Natural
 field recordings (birds, ambience) yield far more clean entropy per minute
